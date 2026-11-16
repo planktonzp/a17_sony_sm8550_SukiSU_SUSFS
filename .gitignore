@@ -1,0 +1,12 @@
+# local build leftovers
+kernel/
+out/
+clang/
+*.img
+Image*
+AnyKernel3*/
+boot-*.img
+*.zip
+*.log
+__pycache__/
+.DS_Store

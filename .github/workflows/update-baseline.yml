@@ -1,0 +1,158 @@
+name: Update baseline
+
+# 从最新 LineageOS 24.0 Nightly 的 boot.img 刷新：
+#   - configs/pdx234.config
+#   - build.env（BOOT_* / LOCALVER / EXPECTED_RELEASE / banner 指纹）
+# KERNEL_COMMIT 默认取 lineage-24.0 分支 tip；若与 banner 中 hash 不一致会写入警告。
+
+on:
+  workflow_dispatch:
+    inputs:
+      boot_date:
+        description: "指定 Nightly 日期 YYYYMMDD；留空=API 最新 24.0"
+        type: string
+        default: ""
+  schedule:
+    # 每周二 UTC 04:00（与旧 a16 仓节奏接近）
+    - cron: "0 4 * * 2"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends wget gzip binutils curl ca-certificates python3 git
+
+      - name: Resolve boot.img URL
+        id: boot
+        env:
+          INPUT_DATE: ${{ inputs.boot_date }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os, urllib.request
+          date = os.environ.get("INPUT_DATE", "").strip()
+          if date:
+              url = f"https://mirrorbits.lineageos.org/full/pdx234/{date}/boot.img"
+              print(f"BOOT_URL={url}")
+              print(f"BOOT_DATE={date}")
+          else:
+              api = "https://download.lineageos.org/api/v2/devices/pdx234/builds"
+              with urllib.request.urlopen(api, timeout=60) as r:
+                  builds = json.load(r)
+              pick = None
+              for b in builds:
+                  if str(b.get("version")) == "24.0":
+                      pick = b
+                      break
+              if not pick:
+                  raise SystemExit("no LineageOS 24.0 build found")
+              boot = None
+              for f in pick.get("files") or []:
+                  if f.get("filename") == "boot.img" or str(f.get("url","")).endswith("/boot.img"):
+                      boot = f
+                      break
+              if not boot:
+                  raise SystemExit("boot.img not found in latest 24.0 build")
+              url = boot["url"]
+              # .../full/pdx234/YYYYMMDD/boot.img
+              boot_date = url.rstrip("/").split("/")[-2]
+              print(f"BOOT_URL={url}")
+              print(f"BOOT_DATE={boot_date}")
+          PY
+          echo "Using $BOOT_URL"
+
+      - name: Download boot + extract IKCONFIG / banner
+        run: |
+          set -euo pipefail
+          export LC_ALL=C LANG=C
+          wget -q -O boot.img "$BOOT_URL"
+          dd if=boot.img of=kernel.bin bs=4096 skip=1 status=none
+          chmod +x .github/scripts/extract-ikconfig scripts/parse_banner.py
+          ./.github/scripts/extract-ikconfig kernel.bin > configs/pdx234.config
+          test -s configs/pdx234.config
+          # BANNER=... 行很长，单独丢掉；其余 KEY=VALUE 写入 GITHUB_ENV
+          python3 scripts/parse_banner.py kernel.bin | grep -v '^BANNER=' >> "$GITHUB_ENV"
+          python3 scripts/parse_banner.py kernel.bin | grep '^EXPECTED_RELEASE='
+
+      - name: Resolve KERNEL_COMMIT
+        run: |
+          set -euo pipefail
+          TIP=$(git ls-remote https://github.com/LineageOS/android_kernel_sony_sm8550.git refs/heads/lineage-24.0 | awk '{print $1}')
+          echo "BRANCH_TIP=$TIP" >> "$GITHUB_ENV"
+          # Prefer banner-embedded short hash if it prefixes the tip / is findable
+          SHORT="${BANNER_HASH}"
+          if [ -n "$SHORT" ] && [[ "$TIP" == "$SHORT"* ]]; then
+            echo "KERNEL_COMMIT=$TIP" >> "$GITHUB_ENV"
+          else
+            echo "KERNEL_COMMIT=$TIP" >> "$GITHUB_ENV"
+            if [ -n "$SHORT" ] && [[ "$TIP" != "$SHORT"* ]]; then
+              echo "::warning::banner hash g$SHORT does not prefix lineage-24.0 tip $TIP — using tip; verify manually"
+            fi
+          fi
+
+      - name: Rewrite build.env
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, os, shlex
+          p = pathlib.Path("build.env")
+          text = p.read_text()
+
+          def assign(k: str, v: str) -> str:
+              # quote when shell-special chars present
+              if re.search(r'[\s\'\"()$`|&;<>]', v):
+                  return f"{k}={shlex.quote(v)}"
+              return f"{k}={v}"
+
+          repl = {
+              "BOOT_DATE": os.environ["BOOT_DATE"],
+              "BOOT_URL": os.environ["BOOT_URL"],
+              "KERNEL_COMMIT": os.environ["KERNEL_COMMIT"],
+              "LOCALVER": os.environ["LOCALVER"],
+              "EXPECTED_RELEASE": os.environ["EXPECTED_RELEASE"],
+              "KBUILD_BUILD_USER": os.environ["KBUILD_BUILD_USER"],
+              "KBUILD_BUILD_HOST": os.environ["KBUILD_BUILD_HOST"],
+              "KBUILD_BUILD_TIMESTAMP": os.environ["KBUILD_BUILD_TIMESTAMP"],
+              "CC_VERSION": os.environ["CC_VERSION"],
+              "LD_VERSION": os.environ["LD_VERSION"],
+          }
+          for k, v in repl.items():
+              text, n = re.subn(rf"^{k}=.*$", assign(k, v), text, count=1, flags=re.M)
+              if n != 1:
+                  raise SystemExit(f"failed to replace {k}")
+          text = re.sub(
+              r"^# Derived from:.*$",
+              f"# Derived from: lineage-24.0-{os.environ['BOOT_DATE']}-nightly-pdx234",
+              text,
+              count=1,
+              flags=re.M,
+          )
+          text = re.sub(
+              r"^# Kernel banner:.*$",
+              f"# Kernel banner: {os.environ['EXPECTED_RELEASE']} (clang from stock boot)",
+              text,
+              count=1,
+              flags=re.M,
+          )
+          p.write_text(text)
+          print(p.read_text())
+          PY
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add build.env configs/pdx234.config
+          if git diff --cached --quiet; then
+            echo "No baseline changes"
+          else
+            git commit -m "chore(baseline): sync LOS24 ${BOOT_DATE} (${EXPECTED_RELEASE})"
+            git push
+          fi
