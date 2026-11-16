@@ -51,7 +51,7 @@ jobs:
 
     steps:
       - name: Checkout orchestration repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Free disk + swap
         run: |
@@ -118,7 +118,7 @@ jobs:
 
       - name: Cache AOSP clang
         id: cache-clang
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: clang
           key: aosp-clang-${{ env.AOSP_CLANG_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
@@ -448,7 +448,7 @@ jobs:
           cat build-info.txt >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: pdx234-los24-${{ env.PROFILE }}
           path: |
