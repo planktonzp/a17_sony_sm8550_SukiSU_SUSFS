@@ -55,13 +55,18 @@ jobs:
 
       - name: Free disk + swap
         run: |
+          # Full/Thin LTO peak RSS easily exceeds the 16G hosted runner.
+          # Keep a moderate swap for link spikes, but leave room for objects/cache
+          # — oversized swap + thrashing is what triggers "lost communication".
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
           sudo apt-get clean
-          sudo fallocate -l 40G /swapfile-lto
+          sudo fallocate -l 24G /swapfile-lto
           sudo chmod 600 /swapfile-lto
           sudo mkswap -q /swapfile-lto
           sudo swapon /swapfile-lto
+          # Prefer reclaiming file cache over thrashing the runner agent.
+          echo 40 | sudo tee /proc/sys/vm/swappiness >/dev/null || true
           free -h
           df -h /
 
@@ -362,9 +367,15 @@ jobs:
           # suppress -dirty
           sed -i "s/printf '%s' -dirty/printf '%s' ''/" scripts/setlocalversion || true
 
+          # Stock pdx234.config uses LTO_CLANG_FULL; that OOMs / thrash-kills the
+          # 16G GitHub-hosted runner (lost communication). ThinLTO keeps LTO on
+          # with a much lower peak; vermagic is unaffected.
+          ./scripts/config --disable LTO_CLANG_FULL
+          ./scripts/config --enable LTO_CLANG_THIN
+
           make ARCH=arm64 LLVM=1 olddefconfig
           echo "=== key configs ==="
-          grep -E '^CONFIG_(KSU|KSU_SUSFS|LOCALVERSION|BBG|TCP_CONG_BBR|ZRAM|CRYPTO_LZ4KD)' .config || true
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|LOCALVERSION|BBG|TCP_CONG_BBR|ZRAM|CRYPTO_LZ4KD|LTO_CLANG)' .config || true
           REL="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
           echo "kernelrelease=$REL"
           if [ "$REL" != "$EXPECTED_RELEASE" ]; then
@@ -381,13 +392,28 @@ jobs:
           KBUILD_BUILD_TIMESTAMP: ${{ env.KBUILD_BUILD_TIMESTAMP }}
         run: |
           set -o pipefail
+          # Cap parallelism: each -flto clang unit is RAM-heavy; -j$(nproc) on a
+          # 4c/16G runner commonly starves the Actions agent into disconnect.
+          NPROC="$(nproc)"
+          JOBS=$(( NPROC > 2 ? 2 : NPROC ))
+          echo "nproc=$NPROC jobs=$JOBS"
+          # Background keepalive so long LTO links still emit logs/heartbeats.
+          (
+            while true; do
+              echo "[keepalive] $(date -u +%H:%M:%SZ) $(grep -E 'MemAvailable|SwapFree' /proc/meminfo | tr '\n' ' ')"
+              sleep 60
+            done
+          ) &
+          KA_PID=$!
+          trap 'kill "$KA_PID" 2>/dev/null || true' EXIT
+
           MAKE_ARGS="ARCH=arm64 LLVM=1 KSU_VERSION=${KSU_VERSION} KSU_VERSION_FULL=${KSU_VERSION_FULL}"
-          if ! make $MAKE_ARGS -j"$(nproc)" Image 2>&1 | tee /tmp/build.log; then
+          if ! make $MAKE_ARGS -j"$JOBS" Image 2>&1 | tee /tmp/build.log; then
             echo "::warning::first build failed; disable WERROR and retry"
             tail -120 /tmp/build.log
             ./scripts/config --disable WERROR
             make ARCH=arm64 LLVM=1 olddefconfig
-            make $MAKE_ARGS -j"$(nproc)" Image 2>&1 | tee /tmp/build.log
+            make $MAKE_ARGS -j"$JOBS" Image 2>&1 | tee /tmp/build.log
           fi
           ls -lh arch/arm64/boot/Image
 
