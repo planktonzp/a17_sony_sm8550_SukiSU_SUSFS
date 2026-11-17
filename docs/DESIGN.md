@@ -29,27 +29,48 @@
 
 | profile | 内容 | 何时用 |
 |---|---|---|
-| `compatible` | SukiSU + SUSFS only | 先求稳、排查兼容性 |
-| `full`（默认） | 上述 + BBG + BBR + LZ4KD/LZ4 | 复现 23.2 增强体验 |
+| `compatible` | Root(SU) + SUSFS only | 先求稳、排查兼容性 |
+| `full`（默认） | SukiSU：BBG + BBR + LZ4KD/LZ4 1.10；**BakaSU：仅 BBR + LZ4KD**（已砍 BBG / LZ4 1.10 / 多余 ZRAM crypto） | 复现或瘦身 23.2 体验 |
 
 `full` 会改动更多 `CONFIG_*`。若出现 Wi‑Fi/相机异常，先用 `compatible` 二分。
+
+## 双流水线（互不交叉）
+
+| | SukiSU | BakaSU |
+|---|---|---|
+| Workflow | `build-kernel.yml` | `build-kernel-bakasu.yml` |
+| Env | `build.env` | `build-bakasu.env` |
+| SU 集成 | tar 拷贝 `drivers/kernelsu` | git checkout + symlink（Kbuild 要 `.git`） |
+| Hook | SukiSU builtin + SUSFS 附加 | **SUSFS Inline Hook**（choice） |
+| Compat 补丁 | `patches/51_fix_sukisu_builtin_compat.patch` | `patches/bakasu/51_fix_sys_read_signature.patch` |
+| 产物名 | `AnyKernel3-*-sukisu-*.zip` | `AnyKernel3-*-bakasu-*.zip` |
+| 管理器 | SukiSU Manager Releases | BakaSU Manager nightly |
+| 依赖获取 | SukiSU 仍有 tar/vendored；clang 用 archive | **一律 git**（clang sparse / SUSFS / LZ4KD）；仅 `boot.img` 仍 HTTP |
+| `full` 增强 | BBG + BBR + LZ4 1.10 + LZ4KD 等 | **BBR + LZ4KD**（无 BBG / 无 LZ4 1.10 / 无多余 ZRAM crypto） |
+| WireGuard | 跟官方 `CONFIG_WIREGUARD=y` | **强制关闭** |
+| LTO | 固定 ThinLTO（hosted 16G） | 可选 `lto=thin\|full`（full 建议 ≥32G runner） |
+
+设备基线（`KERNEL_COMMIT` / vermagic / clang 指纹）由 **Update baseline** 同时写进两份 env；SU 钉死项各自维护。
 
 ## 流水线概览
 
 ```text
-build.env + configs/pdx234.config
+configs/pdx234.config
         │
-        ▼
- LineageOS kernel @ KERNEL_COMMIT
-        │
-        ├─ SukiSU Ultra (builtin, pinned)
-        ├─ SUSFS (vendored | upstream+Sony fixup)
-        ├─ [full] Baseband-guard / BBR / LZ4*
-        ├─ LOCALVERSION = 官方后缀（强制）
-        ├─ Clang 22 + banner 指纹伪装
-        ▼
-   Image ──┬── repack → boot-new.img
-           └── AnyKernel3 → *.zip
+   ┌────┴────┐
+   ▼         ▼
+build.env   build-bakasu.env
+   │         │
+   ▼         ▼
+ SukiSU     BakaSU          ← 独立 workflow，无共享 job
+   │         │
+   ├─ SUSFS (vendored | upstream+Sony fixup)
+   ├─ [full] SukiSU: BBG/BBR/LZ4* ；BakaSU: BBR+LZ4KD
+   ├─ LOCALVERSION = 官方后缀（强制）
+   ├─ Clang 22 + banner 指纹伪装
+   ▼
+ Image ──┬── repack → boot-new.img
+         └── AnyKernel3 → *-sukisu|bakasu-*.zip
 ```
 
 ## 工具链对齐
@@ -59,7 +80,8 @@ build.env + configs/pdx234.config
 | Clang / LLD | **r596125 / 22.0.2** | AOSP `prebuilts/clang/host/linux-x86` @ `android17-release` |
 | pahole | **≥ 1.25**（官方 config 记 `CONFIG_PAHOLE_VERSION=125`） | Ubuntu `dwarves`，启动时校验 |
 | 内核源码 | `build.env` → `KERNEL_COMMIT` | LineageOS `lineage-24.0` |
-| SukiSU | `SUKISU_COMMIT` | 可单独升级，与工具链无关 |
+| SukiSU | `SUKISU_COMMIT`（`build.env`） | 可单独升级，与工具链无关 |
+| BakaSU | `BAKASU_COMMIT`（`build-bakasu.env`） | 可单独升级；与 SukiSU 流水线无关 |
 
 不再使用 `apt.llvm.org` 的通用 LLVM 22，避免与 Android 预编译 clang 的 CFI/补丁集不一致。
 

@@ -1,0 +1,562 @@
+name: Build kernel (BakaSU)
+
+# LineageOS 24.0 / pdx234 — BakaSU 独立流水线（与 SukiSU workflow 无交集）
+# 增强功能（BBR + LZ4KD；已砍 BBG / LZ4 1.10 / 多余 ZRAM crypto）
+# 红线：只产出 boot 相关产物，绝不改动 init_boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "compatible = 仅 BakaSU+SUSFS；full = BBR + LZ4KD"
+        type: choice
+        options: [full, compatible]
+        default: full
+      susfs_source:
+        description: "SUSFS 远程（一律 git clone）：shirkneko 或 simonpunk，再打 Sony fixup"
+        type: choice
+        options: [shirkneko, simonpunk]
+        default: shirkneko
+      lto:
+        description: "thin = 默认（16G runner 友好）；full = Full LTO（需大内存 runner，≥32G 推荐）"
+        type: choice
+        options: [thin, full]
+        default: thin
+      spoof_banner:
+        description: "伪装 /proc/version 指纹以贴近官方"
+        type: boolean
+        default: true
+      create_release:
+        description: "构建成功后创建 GitHub Release"
+        type: boolean
+        default: false
+      release_tag:
+        description: "Release tag（create_release=true 时使用）"
+        type: string
+        default: "v24.0-bakasu-r1"
+      bakasu_commit:
+        description: "覆盖 build-bakasu.env 的 BAKASU_COMMIT（留空则用文件）"
+        type: string
+        default: ""
+      kernel_commit:
+        description: "覆盖 build-bakasu.env 的 KERNEL_COMMIT（留空则用文件）"
+        type: string
+        default: ""
+      boot_url:
+        description: "覆盖 build-bakasu.env 的 BOOT_URL（留空则用文件）"
+        type: string
+        default: ""
+
+concurrency:
+  group: build-kernel-bakasu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout orchestration repo
+        uses: actions/checkout@v5
+
+      - name: Free disk + swap
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost 2>/dev/null || true
+          sudo apt-get clean
+          # Full LTO peak RSS is much higher; give hosted runners a larger cushion.
+          if [ "${{ inputs.lto }}" = "full" ]; then
+            SWAP_GIB=48
+            echo "::warning::lto=full：建议 ≥32G RAM 的 runner；hosted 16G 仍可能 OOM/掉线"
+          else
+            SWAP_GIB=24
+          fi
+          sudo fallocate -l "${SWAP_GIB}G" /swapfile-lto
+          sudo chmod 600 /swapfile-lto
+          sudo mkswap -q /swapfile-lto
+          sudo swapon /swapfile-lto
+          echo 40 | sudo tee /proc/sys/vm/swappiness >/dev/null || true
+          echo "swap=${SWAP_GIB}G lto=${{ inputs.lto }}"
+          free -h
+          df -h /
+
+      - name: Load build-bakasu.env
+        id: env
+        run: |
+          set -a
+          # shellcheck disable=SC1091
+          source ./build-bakasu.env
+          set +a
+
+          if [ -n "${{ inputs.kernel_commit }}" ]; then
+            KERNEL_COMMIT="${{ inputs.kernel_commit }}"
+          fi
+          if [ -n "${{ inputs.boot_url }}" ]; then
+            BOOT_URL="${{ inputs.boot_url }}"
+          fi
+          if [ -n "${{ inputs.bakasu_commit }}" ]; then
+            BAKASU_COMMIT="${{ inputs.bakasu_commit }}"
+          fi
+
+          {
+            echo "KERNEL_REPO=$KERNEL_REPO"
+            echo "KERNEL_COMMIT=$KERNEL_COMMIT"
+            echo "BOOT_URL=$BOOT_URL"
+            echo "BOOT_DATE=$BOOT_DATE"
+            echo "LOCALVER=$LOCALVER"
+            echo "EXPECTED_RELEASE=$EXPECTED_RELEASE"
+            echo "KBUILD_BUILD_USER=$KBUILD_BUILD_USER"
+            echo "KBUILD_BUILD_HOST=$KBUILD_BUILD_HOST"
+            echo "KBUILD_BUILD_VERSION=$KBUILD_BUILD_VERSION"
+            echo "KBUILD_BUILD_TIMESTAMP=$KBUILD_BUILD_TIMESTAMP"
+            echo "CC_VERSION=$CC_VERSION"
+            echo "LD_VERSION=$LD_VERSION"
+            echo "AOSP_CLANG_BRANCH=$AOSP_CLANG_BRANCH"
+            echo "AOSP_CLANG_VERSION=$AOSP_CLANG_VERSION"
+            echo "AOSP_CLANG_EXPECTED=$AOSP_CLANG_EXPECTED"
+            echo "PAHOLE_VERSION_EXPECTED=$PAHOLE_VERSION_EXPECTED"
+            echo "BAKASU_REPO=$BAKASU_REPO"
+            echo "BAKASU_COMMIT=$BAKASU_COMMIT"
+            echo "SUSFS_GKI_BRANCH=$SUSFS_GKI_BRANCH"
+            echo "PROFILE=${{ inputs.profile }}"
+            echo "SUSFS_SOURCE=${{ inputs.susfs_source }}"
+            echo "LTO=${{ inputs.lto }}"
+            echo "SPOOF_BANNER=${{ inputs.spoof_banner }}"
+          } >> "$GITHUB_ENV"
+
+          echo "### Baseline (BakaSU)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- profile: \`${{ inputs.profile }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- susfs: \`${{ inputs.susfs_source }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- lto: \`${{ inputs.lto }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- kernel: \`$KERNEL_COMMIT\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- bakasu: \`$BAKASU_COMMIT\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- release: \`$EXPECTED_RELEASE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- clang: AOSP \`$AOSP_CLANG_VERSION\` (\`$AOSP_CLANG_BRANCH\`, expect $AOSP_CLANG_EXPECTED)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- boot: \`$BOOT_URL\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache AOSP clang
+        id: cache-clang
+        uses: actions/cache@v5
+        with:
+          path: clang
+          key: aosp-clang-git-${{ env.AOSP_CLANG_BRANCH }}-${{ env.AOSP_CLANG_VERSION }}
+
+      - name: Fetch AOSP clang via git sparse (r596125 / 22.0.2)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          rm -rf prebuilts-clang clang
+          git clone --depth=1 --filter=blob:none --sparse \
+            -b "${AOSP_CLANG_BRANCH}" \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            prebuilts-clang
+          (
+            cd prebuilts-clang
+            git sparse-checkout set "clang-${AOSP_CLANG_VERSION}"
+          )
+          test -d "prebuilts-clang/clang-${AOSP_CLANG_VERSION}"
+          mv "prebuilts-clang/clang-${AOSP_CLANG_VERSION}" clang
+          rm -rf prebuilts-clang
+          test -x clang/bin/clang
+
+      - name: Install AOSP clang on PATH
+        run: |
+          set -euo pipefail
+          echo "$GITHUB_WORKSPACE/clang/bin" >> "$GITHUB_PATH"
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          clang --version | tee /tmp/clang-ver.txt
+          ld.lld --version
+          grep -q "$AOSP_CLANG_EXPECTED" /tmp/clang-ver.txt
+          if [ -f clang/AndroidVersion.txt ]; then
+            echo "AndroidVersion.txt:"
+            cat clang/AndroidVersion.txt
+            grep -q "$AOSP_CLANG_EXPECTED" clang/AndroidVersion.txt
+            grep -q "$AOSP_CLANG_VERSION" clang/AndroidVersion.txt
+          else
+            grep -Eq "based on ${AOSP_CLANG_VERSION}|${AOSP_CLANG_VERSION}" /tmp/clang-ver.txt \
+              || echo "::warning::AndroidVersion.txt missing; relied on clang --version only"
+          fi
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libssl-dev libelf-dev libncurses-dev \
+            zip unzip cpio rsync python3 perl git curl wget ca-certificates \
+            dwarves zstd lz4 kmod device-tree-compiler
+          pahole --version | tee /tmp/pahole-ver.txt
+          PV=$(pahole --version | grep -oE '[0-9]+(\.[0-9]+)*' | head -1)
+          MAJOR=$(echo "$PV" | cut -d. -f1)
+          MINOR=$(echo "$PV" | cut -d. -f2)
+          if [ "${MAJOR:-0}" -lt 1 ] || { [ "${MAJOR:-0}" -eq 1 ] && [ "${MINOR:-0}" -lt 25 ]; }; then
+            echo "::error::need pahole >= 1.25 (stock CONFIG_PAHOLE_VERSION=${PAHOLE_VERSION_EXPECTED}), got $PV"
+            exit 1
+          fi
+          echo "pahole OK: $PV"
+
+      - name: Fetch kernel @ pinned commit
+        run: |
+          mkdir kernel && cd kernel
+          git init -q
+          git remote add origin "$KERNEL_REPO"
+          git fetch -q --depth 1 origin "$KERNEL_COMMIT"
+          git checkout -q FETCH_HEAD
+          : > .scmversion
+          echo "HEAD=$(git rev-parse HEAD)"
+          test "$(git rev-parse HEAD)" = "$KERNEL_COMMIT"
+
+      - name: Fetch BakaSU (pinned git checkout)
+        run: |
+          # Kbuild requires bakasu-src/.git (rejects plain tarball copy)
+          mkdir bakasu-src && cd bakasu-src
+          git init -q
+          git remote add origin "https://github.com/${BAKASU_REPO}.git"
+          git fetch -q --depth 1 origin "$BAKASU_COMMIT"
+          git checkout -q FETCH_HEAD
+          test -f kernel/Kconfig
+          grep -q 'config KSU' kernel/Kconfig
+          echo "BAKASU_HEAD=$(git rev-parse HEAD)"
+
+      - name: Integrate BakaSU into kernel tree
+        run: |
+          # Symlink so KSU_SRC/../.git resolves to bakasu-src/.git
+          ln -sfn ../../bakasu-src/kernel kernel/drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' kernel/drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> kernel/drivers/Makefile
+          grep -q 'drivers/kernelsu/Kconfig' kernel/drivers/Kconfig || \
+            sed -i '/^endmenu$/i source "drivers/kernelsu/Kconfig"' kernel/drivers/Kconfig
+          ls -ld kernel/drivers/kernelsu
+          test -e bakasu-src/.git
+          test -e kernel/drivers/kernelsu/../.git || test -e bakasu-src/kernel/../.git
+          # Resolve: drivers/kernelsu -> ../../bakasu-src/kernel ; ../.git = bakasu-src/.git
+          test -e "$(realpath kernel/drivers/kernelsu)/../.git"
+          tail -3 kernel/drivers/Makefile
+
+      - name: Apply SUSFS (git clone + Sony fixup)
+        run: |
+          set -euo pipefail
+          rm -rf susfs4ksu
+          case "$SUSFS_SOURCE" in
+            shirkneko)
+              git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_GKI_BRANCH" susfs4ksu
+              ;;
+            simonpunk)
+              git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_GKI_BRANCH" susfs4ksu
+              ;;
+            *)
+              echo "::error::unknown susfs_source=$SUSFS_SOURCE"
+              exit 1
+              ;;
+          esac
+          PATCH="susfs4ksu/kernel_patches/50_add_susfs_in_${SUSFS_GKI_BRANCH}.patch"
+          test -f "$PATCH"
+          cp "$PATCH" kernel/
+          cp susfs4ksu/kernel_patches/fs/* kernel/fs/
+          cp susfs4ksu/kernel_patches/include/linux/* kernel/include/linux/
+          cd kernel
+          patch -p1 --fuzz=3 -f < "$(basename "$PATCH")" || true
+          patch -p1 -f < ../patches/sony_sm8550_susfs_fixup.patch
+          # BakaSU keeps static_key; only align sys_read ABI if still void(fd)
+          if grep -q 'void ksu_handle_sys_read(unsigned int fd)' fs/read_write.c; then
+            patch -p1 -F3 --no-backup-if-mismatch < ../patches/bakasu/51_fix_sys_read_signature.patch || \
+              echo "::warning::bakasu sys_read signature patch had rejects (may already match)"
+          fi
+          grep -q 'linux/susfs_def.h' fs/namespace.c
+          grep -q 'CL_COPY_MNT_NS' fs/namespace.c
+          grep -m1 SUSFS_VERSION include/linux/susfs.h || true
+
+      - name: task_mmu.c hygiene (android13-5.15)
+        working-directory: kernel
+        run: |
+          if grep -qxF $'\t\tgoto show_pad;' ./fs/proc/task_mmu.c; then
+            sed -i -e 's/goto show_pad;/return 0;/' ./fs/proc/task_mmu.c
+            sed -i '/show_pad:/d' ./fs/proc/task_mmu.c
+            echo "applied task_mmu fix"
+          fi
+
+      - name: Apply LZ4KD (full)
+        if: env.PROFILE == 'full'
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/ShirkNeko/SukiSU_patch.git
+          cd kernel
+          cp -r ../SukiSU_patch/other/zram/lz4k/include/linux/* ./include/linux/ || true
+          cp -r ../SukiSU_patch/other/zram/lz4k/lib/* ./lib/ || true
+          cp -r ../SukiSU_patch/other/zram/lz4k/crypto/* ./crypto/ || true
+          if [ -f ../SukiSU_patch/other/zram/zram_patch/5.15/lz4kd.patch ]; then
+            patch -p1 -F 3 < ../SukiSU_patch/other/zram/zram_patch/5.15/lz4kd.patch || \
+              echo "::warning::lz4kd patch had rejects"
+          fi
+
+      - name: Mask /proc/version fingerprint
+        if: env.SPOOF_BANNER == 'true'
+        working-directory: kernel
+        env:
+          CC_VERSION: ${{ env.CC_VERSION }}
+          LD_VERSION: ${{ env.LD_VERSION }}
+        run: |
+          python3 - <<'PY'
+          import os
+          p = "scripts/mkcompile_h"
+          s = open(p).read()
+          marker = "printf '#define LINUX_COMPILER"
+          assert s.count(marker) == 1
+          cc = os.environ["CC_VERSION"].replace("\\", "\\\\").replace('"', '\\"')
+          ld = os.environ["LD_VERSION"].replace("\\", "\\\\").replace('"', '\\"')
+          fake = f'CC_VERSION="{cc}"\nLD_VERSION="{ld}"\n'
+          open(p, "w").write(s.replace(marker, fake + marker, 1))
+          print("mkcompile_h patched")
+          PY
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          cp ../configs/pdx234.config .config
+
+          # Stock enables WireGuard; BakaSU pipeline turns it off.
+          ./scripts/config --disable WIREGUARD
+
+          # --- BakaSU + SUSFS Inline Hook (both profiles) ---
+          # Hook method is a choice: enable KSU_SUSFS (not TRACEPOINT / MANUAL)
+          ./scripts/config --enable KSU
+          ./scripts/config --disable KSU_TRACEPOINT_HOOK || true
+          ./scripts/config --disable KSU_MANUAL_HOOK || true
+          ./scripts/config --enable KSU_SUSFS
+          ./scripts/config --disable KSU_DEBUG
+          ./scripts/config --enable KSU_MULTI_MANAGER_SUPPORT || true
+          ./scripts/config --disable KSU_DISABLE_MANAGER || true
+          ./scripts/config --disable KSU_DISABLE_POLICY || true
+          ./scripts/config --disable KSU_TOOLKIT_SUPPORT || true
+
+          ./scripts/config --enable KSU_SUSFS_SUS_PATH
+          ./scripts/config --enable KSU_SUSFS_SUS_MOUNT
+          ./scripts/config --enable KSU_SUSFS_SUS_KSTAT
+          ./scripts/config --enable KSU_SUSFS_SPOOF_UNAME
+          ./scripts/config --enable KSU_SUSFS_ENABLE_LOG
+          ./scripts/config --enable KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS
+          ./scripts/config --enable KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG
+          ./scripts/config --enable KSU_SUSFS_OPEN_REDIRECT
+          ./scripts/config --enable KSU_SUSFS_SUS_MAP
+
+          # --- slim full: BBR + LZ4KD only (no BBG / LZ4 1.10 / extra ZRAM crypto) ---
+          if [ "$PROFILE" = "full" ]; then
+            ./scripts/config --enable ZSMALLOC
+            ./scripts/config --enable ZRAM
+            # LZ4K is the codec family; LZ4KD is the only extra compressor we keep
+            ./scripts/config --enable CRYPTO_LZ4K || true
+            ./scripts/config --enable CRYPTO_LZ4KD || true
+            ./scripts/config --enable ZRAM_DEF_COMP_LZ4KD || true
+
+            ./scripts/config --enable TMPFS_XATTR || true
+            ./scripts/config --enable TMPFS_POSIX_ACL || true
+            ./scripts/config --enable TCP_CONG_ADVANCED
+            ./scripts/config --enable TCP_CONG_BBR
+            ./scripts/config --enable NET_SCH_FQ
+            ./scripts/config --enable DEFAULT_BBR
+            ./scripts/config --disable TCP_CONG_BIC || true
+            ./scripts/config --disable TCP_CONG_WESTWOOD || true
+            ./scripts/config --disable TCP_CONG_HTCP || true
+          fi
+
+          # --- vermagic lock ---
+          ./scripts/config --set-str LOCALVERSION "$LOCALVER"
+          ./scripts/config --disable LOCALVERSION_AUTO
+          sed -i "s/printf '%s' -dirty/printf '%s' ''/" scripts/setlocalversion || true
+
+          case "$LTO" in
+            full)
+              ./scripts/config --disable LTO_CLANG_THIN
+              ./scripts/config --enable LTO_CLANG_FULL
+              ;;
+            thin)
+              ./scripts/config --disable LTO_CLANG_FULL
+              ./scripts/config --enable LTO_CLANG_THIN
+              ;;
+            *)
+              echo "::error::unknown lto=$LTO (expected thin|full)"
+              exit 1
+              ;;
+          esac
+
+          make ARCH=arm64 LLVM=1 olddefconfig
+          echo "=== key configs ==="
+          grep -E '^CONFIG_(KSU|KSU_SUSFS|KSU_TRACEPOINT|KSU_MANUAL|LOCALVERSION|TCP_CONG_BBR|ZRAM|CRYPTO_LZ4K|CRYPTO_LZ4KD|WIREGUARD|LTO_CLANG)' .config || true
+          if grep -q '^CONFIG_WIREGUARD=y' .config; then
+            echo "::error::CONFIG_WIREGUARD still enabled"
+            exit 1
+          fi
+          if [ "$LTO" = "full" ]; then
+            grep -q '^CONFIG_LTO_CLANG_FULL=y' .config || {
+              echo "::error::expected CONFIG_LTO_CLANG_FULL=y"
+              exit 1
+            }
+          else
+            grep -q '^CONFIG_LTO_CLANG_THIN=y' .config || {
+              echo "::error::expected CONFIG_LTO_CLANG_THIN=y"
+              exit 1
+            }
+          fi
+          # Must be SUSFS hook, not Tracepoint
+          if ! grep -q '^CONFIG_KSU_SUSFS=y' .config; then
+            echo "::error::CONFIG_KSU_SUSFS not enabled (BakaSU hook choice failed)"
+            exit 1
+          fi
+          if grep -q '^CONFIG_KSU_TRACEPOINT_HOOK=y' .config; then
+            echo "::error::CONFIG_KSU_TRACEPOINT_HOOK still enabled; expected SUSFS hook"
+            exit 1
+          fi
+          REL="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
+          echo "kernelrelease=$REL"
+          if [ "$REL" != "$EXPECTED_RELEASE" ]; then
+            echo "::error::kernelrelease '$REL' != expected '$EXPECTED_RELEASE'"
+            exit 1
+          fi
+
+      - name: Build Image
+        working-directory: kernel
+        env:
+          KBUILD_BUILD_USER: ${{ env.KBUILD_BUILD_USER }}
+          KBUILD_BUILD_HOST: ${{ env.KBUILD_BUILD_HOST }}
+          KBUILD_BUILD_VERSION: ${{ env.KBUILD_BUILD_VERSION }}
+          KBUILD_BUILD_TIMESTAMP: ${{ env.KBUILD_BUILD_TIMESTAMP }}
+        run: |
+          set -o pipefail
+          NPROC="$(nproc)"
+          # Full LTO: keep parallelism low on small hosts; scale up when RAM is ample.
+          MEM_GIB="$(awk '/MemTotal:/ {printf "%d", $2/1024/1024}' /proc/meminfo)"
+          if [ "$LTO" = "full" ]; then
+            if [ "$MEM_GIB" -ge 48 ]; then
+              JOBS=$(( NPROC > 4 ? 4 : NPROC ))
+            elif [ "$MEM_GIB" -ge 32 ]; then
+              JOBS=$(( NPROC > 2 ? 2 : NPROC ))
+            else
+              JOBS=1
+            fi
+          else
+            JOBS=$(( NPROC > 2 ? 2 : NPROC ))
+          fi
+          echo "nproc=$NPROC mem=${MEM_GIB}G lto=$LTO jobs=$JOBS"
+          (
+            while true; do
+              echo "[keepalive] $(date -u +%H:%M:%SZ) $(grep -E 'MemAvailable|SwapFree' /proc/meminfo | tr '\n' ' ')"
+              sleep 60
+            done
+          ) &
+          KA_PID=$!
+          trap 'kill "$KA_PID" 2>/dev/null || true' EXIT
+
+          # Version comes from BakaSU Kbuild/git; do not inject SukiSU KSU_VERSION_*
+          MAKE_ARGS="ARCH=arm64 LLVM=1"
+          if ! make $MAKE_ARGS -j"$JOBS" Image 2>&1 | tee /tmp/build.log; then
+            echo "::warning::first build failed; disable WERROR and retry"
+            tail -120 /tmp/build.log
+            ./scripts/config --disable WERROR
+            make ARCH=arm64 LLVM=1 olddefconfig
+            make $MAKE_ARGS -j"$JOBS" Image 2>&1 | tee /tmp/build.log
+          fi
+          ls -lh arch/arm64/boot/Image
+
+      - name: Verify vermagic / SUSFS
+        working-directory: kernel
+        run: |
+          REL="$(make -s ARCH=arm64 LLVM=1 kernelrelease)"
+          test "$REL" = "$EXPECTED_RELEASE"
+          if strings arch/arm64/boot/Image | grep -q "${EXPECTED_RELEASE}+"; then
+            echo "::error::dirty suffix found in Image"
+            exit 1
+          fi
+          strings arch/arm64/boot/Image | grep -qi susfs
+          echo "OK vermagic=$REL"
+
+      - name: Repack boot-new.img
+        run: |
+          curl -fsSL "$BOOT_URL" -o boot-stock.img
+          python3 scripts/repack_boot.py boot-stock.img kernel/arch/arm64/boot/Image boot-new.img
+          python3 scripts/verify_boot.py boot-new.img
+          cp kernel/arch/arm64/boot/Image Image-pdx234
+          ls -lh boot-new.img Image-pdx234
+
+      - name: Package AnyKernel3
+        run: |
+          git clone --depth=1 https://github.com/WildKernels/AnyKernel3.git -b gki-2.0 AnyKernel3
+          cp Image-pdx234 AnyKernel3/Image
+          if [ -f AnyKernel3/anykernel.sh ]; then
+            sed -i 's/block=.*;/block=\/dev\/block\/by-name\/boot;/' AnyKernel3/anykernel.sh || true
+          fi
+          (
+            cd AnyKernel3
+            zip -r9 -q "../AnyKernel3-pdx234-bakasu-${PROFILE}-lto${LTO}.zip" \
+              * -x .git .github README.md '*placeholder'
+          )
+          ls -lh "AnyKernel3-pdx234-bakasu-${PROFILE}-lto${LTO}.zip"
+
+      - name: Write build-info
+        run: |
+          {
+            echo "device: pdx234"
+            echo "lineage: 24.0"
+            echo "su: bakasu"
+            echo "profile: ${PROFILE}"
+            echo "lto: ${LTO}"
+            echo "susfs_source: ${SUSFS_SOURCE}"
+            echo "kernel_commit: ${KERNEL_COMMIT}"
+            echo "expected_release: ${EXPECTED_RELEASE}"
+            echo "boot_url: ${BOOT_URL}"
+            echo "aosp_clang: ${AOSP_CLANG_BRANCH}/clang-${AOSP_CLANG_VERSION} (expect ${AOSP_CLANG_EXPECTED})"
+            echo "clang_version: $(clang --version | head -1)"
+            echo "lld_version: $(ld.lld --version | head -1)"
+            echo "pahole_version: $(pahole --version | head -1)"
+            echo "bakasu_commit: ${BAKASU_COMMIT}"
+            echo "spoof_banner: ${SPOOF_BANNER}"
+            echo "built_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > build-info.txt
+          cat build-info.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v5
+        with:
+          name: pdx234-los24-bakasu-${{ env.PROFILE }}-lto${{ env.LTO }}
+          path: |
+            boot-new.img
+            Image-pdx234
+            AnyKernel3-pdx234-bakasu-${{ env.PROFILE }}-lto${{ env.LTO }}.zip
+            build-info.txt
+          retention-days: 90
+
+      - name: Create Release
+        if: ${{ inputs.create_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          NOTES=$(cat <<EOF
+          ## LineageOS 24.0 / pdx234 (BakaSU)
+
+          - su: \`bakasu\`
+          - profile: \`${PROFILE}\`
+          - lto: \`${LTO}\`
+          - susfs: \`${SUSFS_SOURCE}\`
+          - kernel: \`${EXPECTED_RELEASE}\` (\`${KERNEL_COMMIT}\`)
+          - bakasu: \`${BAKASU_COMMIT}\`
+          - baseline boot: \`${BOOT_URL}\`
+
+          ### Flash
+          \`\`\`bash
+          fastboot flash boot boot-new.img
+          # DO NOT flash init_boot
+          \`\`\`
+
+          Or flash \`AnyKernel3-*.zip\` via Horizon Kernel Flasher / TWRP (boot only).
+
+          Manager: https://nightly.link/Baka-SU/BakaSU/workflows/build-manager/main
+          EOF
+          )
+          gh release create "$TAG" \
+            --title "pdx234 LOS24 BakaSU (${PROFILE}, lto=${LTO}) ${TAG}" \
+            --notes "$NOTES" \
+            boot-new.img Image-pdx234 \
+            "AnyKernel3-pdx234-bakasu-${PROFILE}-lto${LTO}.zip" build-info.txt

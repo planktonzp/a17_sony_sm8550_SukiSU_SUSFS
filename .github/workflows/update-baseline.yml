@@ -2,7 +2,8 @@ name: Update baseline
 
 # 从最新 LineageOS 24.0 Nightly 的 boot.img 刷新：
 #   - configs/pdx234.config
-#   - build.env（BOOT_* / LOCALVER / EXPECTED_RELEASE / banner 指纹）
+#   - build.env（SukiSU 流水线）
+#   - build-bakasu.env（BakaSU 流水线；仅同步设备/工具链钉死项，不改 BAKASU_*）
 # KERNEL_COMMIT 默认取 lineage-24.0 分支 tip；若与 banner 中 hash 不一致会写入警告。
 
 on:
@@ -98,15 +99,12 @@ jobs:
             fi
           fi
 
-      - name: Rewrite build.env
+      - name: Rewrite build.env + build-bakasu.env
         run: |
           python3 - <<'PY'
           import pathlib, re, os, shlex
-          p = pathlib.Path("build.env")
-          text = p.read_text()
 
           def assign(k: str, v: str) -> str:
-              # quote when shell-special chars present
               if re.search(r'[\s\'\"()$`|&;<>]', v):
                   return f"{k}={shlex.quote(v)}"
               return f"{k}={v}"
@@ -123,33 +121,40 @@ jobs:
               "CC_VERSION": os.environ["CC_VERSION"],
               "LD_VERSION": os.environ["LD_VERSION"],
           }
-          for k, v in repl.items():
-              text, n = re.subn(rf"^{k}=.*$", assign(k, v), text, count=1, flags=re.M)
-              if n != 1:
-                  raise SystemExit(f"failed to replace {k}")
-          text = re.sub(
-              r"^# Derived from:.*$",
-              f"# Derived from: lineage-24.0-{os.environ['BOOT_DATE']}-nightly-pdx234",
-              text,
-              count=1,
-              flags=re.M,
-          )
-          text = re.sub(
-              r"^# Kernel banner:.*$",
-              f"# Kernel banner: {os.environ['EXPECTED_RELEASE']} (clang from stock boot)",
-              text,
-              count=1,
-              flags=re.M,
-          )
-          p.write_text(text)
-          print(p.read_text())
+
+          def rewrite(path: pathlib.Path) -> None:
+              text = path.read_text()
+              for k, v in repl.items():
+                  text, n = re.subn(rf"^{k}=.*$", assign(k, v), text, count=1, flags=re.M)
+                  if n != 1:
+                      raise SystemExit(f"failed to replace {k} in {path}")
+              text = re.sub(
+                  r"^# Derived from:.*$",
+                  f"# Derived from: lineage-24.0-{os.environ['BOOT_DATE']}-nightly-pdx234",
+                  text,
+                  count=1,
+                  flags=re.M,
+              )
+              text = re.sub(
+                  r"^# Kernel banner:.*$",
+                  f"# Kernel banner: {os.environ['EXPECTED_RELEASE']} (clang from stock boot)",
+                  text,
+                  count=1,
+                  flags=re.M,
+              )
+              path.write_text(text)
+              print(f"=== {path} ===")
+              print(path.read_text())
+
+          rewrite(pathlib.Path("build.env"))
+          rewrite(pathlib.Path("build-bakasu.env"))
           PY
 
       - name: Commit if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add build.env configs/pdx234.config
+          git add build.env build-bakasu.env configs/pdx234.config
           if git diff --cached --quiet; then
             echo "No baseline changes"
           else
