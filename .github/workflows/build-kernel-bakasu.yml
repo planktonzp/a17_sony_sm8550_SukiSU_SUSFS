@@ -13,10 +13,10 @@ on:
         options: [full, compatible]
         default: full
       susfs_source:
-        description: "SUSFS 远程（一律 git clone）：shirkneko 或 simonpunk，再打 Sony fixup"
+        description: "SUSFS 远程（一律 git）：simonpunk=上游 GitLab；shirkneko=GitHub（若 404 自动回退 GitLab）"
         type: choice
-        options: [shirkneko, simonpunk]
-        default: shirkneko
+        options: [simonpunk, shirkneko]
+        default: simonpunk
       lto:
         description: "thin = 默认（16G runner 友好）；full = Full LTO（需大内存 runner，≥32G 推荐）"
         type: choice
@@ -239,12 +239,20 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf susfs4ksu
+          clone_simonpunk() {
+            git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_GKI_BRANCH" susfs4ksu
+          }
           case "$SUSFS_SOURCE" in
-            shirkneko)
-              git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_GKI_BRANCH" susfs4ksu
-              ;;
             simonpunk)
-              git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git -b "$SUSFS_GKI_BRANCH" susfs4ksu
+              clone_simonpunk
+              ;;
+            shirkneko)
+              # ShirkNeko/susfs4ksu 已多次出现 404/不可用；失败则回退上游 GitLab
+              if ! git clone --depth=1 https://github.com/ShirkNeko/susfs4ksu.git -b "$SUSFS_GKI_BRANCH" susfs4ksu; then
+                echo "::warning::ShirkNeko/susfs4ksu clone failed; falling back to simonpunk GitLab"
+                rm -rf susfs4ksu
+                clone_simonpunk
+              fi
               ;;
             *)
               echo "::error::unknown susfs_source=$SUSFS_SOURCE"

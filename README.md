@@ -30,7 +30,7 @@ Sony Xperia 1 V（`pdx234`）· **LineageOS 24.0** 内核 CI 编排仓。
    - **Build kernel** ← SukiSU（`build.env`）  
    - **Build kernel (BakaSU)** ← BakaSU（`build-bakasu.env`）  
    - 共同输入：`profile`=`full`|`compatible`  
-   - SukiSU `susfs_source`：`vendored`|`upstream`；BakaSU：`shirkneko`|`simonpunk`（一律 git）  
+   - SukiSU `susfs_source`：`vendored`|`upstream`；BakaSU：`simonpunk`（默认）|`shirkneko`（404 则回退 GitLab）  
    - BakaSU `lto`：`thin`（默认）|`full`（Full LTO，建议大内存 runner）  
 3. 下载 Artifact：`boot-new.img` / `AnyKernel3-*-sukisu|bakasu-*.zip` / `Image`
 
